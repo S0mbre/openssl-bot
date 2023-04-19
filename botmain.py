@@ -1,17 +1,18 @@
 import logging
 import asyncio
 from aiogram import Bot, Dispatcher, F, html
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, Text
 from aiogram.utils import markdown as md
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, BufferedInputFile, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import CONFIG
+import ossl
 
 # ============================================================ #
-# openssl pkcs12 -export -in cert.crt -inkey cert.key -password pass:123123 -out cert1.p12
 
 ESCAPE_MAP = {'_': '\\_', '*': '\\*', '[': '\\[', ']': '\\]', '(': '\\(', ')': '\\)', 
               '~': '\\~', '`': '\\`', '>': '\\>', '#': '\\#', '+': '\\+', '-': '\\-', 
@@ -34,6 +35,10 @@ BOT_HELP = \
 -----BEGIN CERTIFICATE-----
 <тело ключа>
 -----END CERTIFICATE-----
+
+КОМАНДЫ:
+- /start: прервать сессию и начать заново, отобразив эту подсказку
+- /checkssl: проверить установку OpenSSL
 """
 
 logging.basicConfig(level=logging.INFO)
@@ -43,9 +48,25 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # ============================================================ #
 
-def make_row_keyboard(items: list[str]) -> ReplyKeyboardMarkup:
-    row = [KeyboardButton(text=item) for item in items]
-    return ReplyKeyboardMarkup(keyboard=[row], resize_keyboard=True)
+class MyStates(StatesGroup):
+    start_state = State()
+    sending_crt_state = State()
+    sending_key_state = State()
+    setting_name_state = State()
+    setting_pw_state = State()
+
+START_BUTTONS = ['Проверка SSL', 'Начать', 'Сброс']
+CRT_BUTTONS = ['Сброс', 'Загрузить повторно', 'Далее']
+NAME_BUTTONS = ['Сброс', 'Изменить имя', 'Далее']
+PW_BUTTONS = ['Сброс', 'Изменить пароль', 'Завершить']
+
+# ============================================================ #
+
+def make_keyboard(items: list[str], placeholder: str = 'Выберите действие') -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.add(*[KeyboardButton(text=item) for item in items])
+    builder.adjust(min(3, len(items)))
+    return builder.as_markup(resize_keyboard=True, input_field_placeholder=placeholder or None)
 
 def escape_symbols(msg: str) -> str:
     msg_ = msg
@@ -53,14 +74,59 @@ def escape_symbols(msg: str) -> str:
         msg_ = msg_.replace(k, v)
     return msg_
 
-@dp.message(Command('start'))
-async def send_welcome(message: Message):
-    await message.answer(BOT_HELP)
-    # await message.answer(md.text(md.bold('Fuck'), ('you\\!')), parse_mode='MarkdownV2')
+@dp.message(Command(commands=['start', 'help']))
+@dp.message(Text(text=['Сброс']))
+async def start(message: Message, state: FSMContext):
+    if message.text != '/help':
+        # await state.clear()
+        await state.set_state(MyStates.start_state)
+    await message.answer(BOT_HELP, reply_markup=make_keyboard(START_BUTTONS))
 
-@dp.message(F.text)
-async def handler(message: Message):
-	await message.answer(message.text)
+@dp.message(MyStates.start_state, Text(text='Проверка SSL'))
+async def checkssl(message: Message):
+    res = ossl.check_ossl()
+    if res:
+        await message.answer(f'OpenSSL установлен: {res}', 
+                             reply_markup=make_keyboard(START_BUTTONS))
+    else:
+        await message.answer('OpenSSL не установлен или неправильно работает', 
+                             reply_markup=make_keyboard(START_BUTTONS))
+
+@dp.message(MyStates.start_state, Text(text='Начать'))
+async def send_crt(message: Message, state: FSMContext):
+    await state.set_state(MyStates.sending_crt_state)
+    await message.answer('Отправьте текст или файл SSL сертификата (.crt, .pem)', 
+                         reply_markup=ReplyKeyboardRemove())
+
+@dp.message(MyStates.sending_crt_state, F.text.startswith('-----BEGIN CERTIFICATE-----'))
+async def send_crt_text(message: Message, state: FSMContext):
+    # await state.set_state(MyStates.sending_crt_state)
+    await state.set_data({'crt': message.text})    
+    await message.answer('Получен SSL сертификат (.crt, .pem)', 
+                         reply_markup=make_keyboard(CRT_BUTTONS))
+
+@dp.message(MyStates.sending_crt_state, F.document)
+async def send_crt_file(message: Message, state: FSMContext, bot: Bot):
+    # await state.set_state(MyStates.sending_crt_state)
+    file = await bot.get_file(message.document.file_id)
+    iostream = await bot.download_file(file.file_path)
+    await state.set_data({'crt': iostream.getvalue().decode(ossl.ENC)})
+    await message.answer(f'Получен SSL сертификат (.crt, .pem): {message.document.file_name}',
+                         reply_markup=make_keyboard(CRT_BUTTONS))  
+
+@dp.message(MyStates.sending_crt_state, Text(text='Загрузить повторно'))
+async def send_crt_text_reload(message: Message, state: FSMContext):
+    await state.set_state(MyStates.sending_crt_state)
+    await message.answer('Отправьте текст или файл SSL сертификата (.crt, .pem)', reply_markup=ReplyKeyboardRemove())
+
+@dp.message(MyStates.sending_crt_state, Text(text='Далее'))
+async def crt_next(message: Message, state: FSMContext):
+    await state.set_state(MyStates.sending_key_state)
+    # await message.answer('Отправьте текст или файл приватного ключа (.key, .pem)', reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    await message.answer(data['crt'], reply_markup=ReplyKeyboardRemove())
+        
+      
     
 async def main():
     await dp.start_polling(bot, skip_updates=True)
