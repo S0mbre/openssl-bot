@@ -11,9 +11,10 @@ OSPLATFORM = platform.system()
 SSLEXE = Path(CONFIG.openssl_root) / 'openssl'
 TEMP = Path(CONFIG.temp_dir)
 ENC = 'utf-8'
-PEM_START = '-----BEGIN CERTIFICATE-----'
-PEM_END = '-----END CERTIFICATE-----'
+PEM_START = '-----BEGIN'
+PEM_END = '-----END'
 NL = '\n'
+PemType = Union[str, io.BytesIO, bytes, None]
 
 # ============================================================ #
 
@@ -54,11 +55,18 @@ def check_ossl():
         logging.exception(traceback.format_exc())
         return None
     
-def process_pem(pem: Union[str, io.BytesIO], filename: str) -> Path:
-    if not isinstance(pem, str):
+def process_pem(pem: PemType, filename: str) -> Path:
+    if pem is None:
+        raise Exception(f'PEM file "{filename}" is NULL')
+    if isinstance(pem, io.BytesIO):
         pem = pem.getvalue().decode(ENC)
-    lines_pem = [l for l in pem.splitlines() if l.strip()]
-    if len(lines_pem) < 3 or lines_pem[0] != PEM_START or lines_pem[-1] != PEM_END:
+    elif isinstance(pem, bytes):
+        pem = pem.decode(ENC)
+    elif not isinstance(pem, str):
+        raise Exception(f'Wrong PEM format in file "{filename}"')
+
+    lines_pem = [l.strip() for l in pem.splitlines() if l.strip()]
+    if len(lines_pem) < 3 or not (lines_pem[0].startswith(PEM_START) and lines_pem[-1].startswith(PEM_END)):
         raise Exception(f'Wrong PEM format in file "{filename}"')
     if len(lines_pem) > 3:
         lines_pem = [lines_pem[0], ''.join(lines_pem[1:-1]), lines_pem[-1]]
@@ -69,22 +77,44 @@ def process_pem(pem: Union[str, io.BytesIO], filename: str) -> Path:
         f.write(NL.join(lines_pem))
     return fpath
     
-def make_pkcs12(cert: Union[str, io.BytesIO], key: Union[str, io.BytesIO], name: str = None, password: str = None) -> bytes:
+def make_pkcs12(cert: PemType, certchain: PemType, key: PemType, name: str = None, password: str = None) -> bytes:
     if not check_ossl():
         raise Exception('OpenSSL path not found or invalid')
     
     uid = generate_uid()
 
-    cert_file = process_pem(cert, f'{uid}.crt')
-    key_file = process_pem(key, f'{uid}.key')
-
     outfile = TEMP / f'{uid}.p12'
     if outfile.exists():
         os.remove(outfile)
 
-    # openssl pkcs12 -export -in cert.crt -inkey cert.key -passout pass:123123 -out cert1.p12
-    args = [SSLEXE, 'pkcs12', '-export', '-in', str(cert_file), '-inkey', str(key_file), '-passout', f'pass:{password or ""}', '-out', str(outfile)]
+    args = [SSLEXE, 'pkcs12', '-export', '-passout', f'pass:{password or ""}', '-out', str(outfile)]
     if name: args += ['-name', name]
+
+    if not key is None:
+        key_file = process_pem(key, f'{uid}.key')
+        args += ['-inkey', str(key_file)]
+    else:
+        args += ['-nokeys']
+
+    if not cert is None:
+        cert_file = process_pem(cert, f'{uid}.crt')
+        # openssl pkcs12 -export -in cert.crt -inkey cert.key -passout pass:123123 -out cert1.p12
+        args += ['-in', str(cert_file)]
+    elif not certchain is None:
+        certchain_file = process_pem(certchain, f'{uid}.pem')
+        # openssl pkcs12 -export -in certchain.pem -inkey cert.key -passout pass:123123 -out cert1.p12
+        args += ['-in', str(certchain_file)]
+    else:
+        raise Exception('At least a CERT or a CERT CHAIN file must exist!')
+    
+    try:
+        res = run_exe(args)
+        if res.returncode:
+            raise Exception(res.stderr if res.stderr else res.stdout)
+        res.check_returncode()
+    except:
+        logging.exception(traceback.format_exc())
+        raise
 
     if not outfile.exists():
         raise Exception(f'Error exporting PKCS key to "{str(outfile)}"')
@@ -92,4 +122,5 @@ def make_pkcs12(cert: Union[str, io.BytesIO], key: Union[str, io.BytesIO], name:
     res = None
     with open(outfile, 'rb') as f:
         res = f.read()
+
     return res
